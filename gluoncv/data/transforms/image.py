@@ -13,7 +13,7 @@ __all__ = ['imresize', 'resize_long', 'resize_short_within',
 def imresize(src, w, h, interp=1):
     """Resize image with OpenCV.
 
-    This is a duplicate of mxnet.image.imresize for name space consistancy.
+    This is a duplicate of mxnet.image.imresize for name space consistency.
 
     Parameters
     ----------
@@ -45,12 +45,14 @@ def imresize(src, w, h, interp=1):
     >>> print(img.shape)
     (200, 200, 3)
     """
-    return mx.image.imresize(src, w, h, interp)
+    from mxnet.image.image import _get_interp_method as get_interp
+    oh, ow, _ = src.shape
+    return mx.image.imresize(src, w, h, interp=get_interp(interp, (oh, ow, h, w)))
 
 def resize_long(src, size, interp=2):
     """Resizes longer edge to size.
-    Note: `resize_short` uses OpenCV (not the CV2 Python library).
-    MXNet must have been built with OpenCV for `resize_short` to work.
+    Note: `resize_long` uses OpenCV (not the CV2 Python library).
+    MXNet must have been built with OpenCV for `resize_long` to work.
     Resizes the original image by setting the longer edge to size
     and setting the shorter edge accordingly. This will ensure the new image will
     fit into the `size` specified.
@@ -74,7 +76,7 @@ def resize_long(src, size, interp=2):
         3: Bicubic interpolation over 4x4 pixel neighborhood.
         4: Lanczos interpolation over 8x8 pixel neighborhood.
         9: Cubic for enlarge, area for shrink, bilinear for others
-        10: Random select from interpolation method metioned above.
+        10: Random select from interpolation method mentioned above.
         Note:
         When shrinking an image, it will generally look best with AREA-based
         interpolation, whereas, when enlarging an image, it will generally look best
@@ -106,7 +108,7 @@ def resize_long(src, size, interp=2):
         new_h, new_w = size * h // w, size
     return imresize(src, new_w, new_h, interp=get_interp(interp, (h, w, new_h, new_w)))
 
-def resize_short_within(src, short, max_size, interp=2):
+def resize_short_within(src, short, max_size, mult_base=1, interp=2):
     """Resizes shorter edge to size but make sure it's capped at maximum size.
     Note: `resize_short_within` uses OpenCV (not the CV2 Python library).
     MXNet must have been built with OpenCV for `resize_short_within` to work.
@@ -123,6 +125,8 @@ def resize_short_within(src, short, max_size, interp=2):
         Resize shorter side to ``short``.
     max_size : int
         Make sure the longer side of new image is smaller than ``max_size``.
+    mult_base : int, default is 1
+        Width and height are rounded to multiples of `mult_base`.
     interp : int, optional, default=2
         Interpolation method used for resizing the image.
         Possible values:
@@ -135,7 +139,7 @@ def resize_short_within(src, short, max_size, interp=2):
         3: Bicubic interpolation over 4x4 pixel neighborhood.
         4: Lanczos interpolation over 8x8 pixel neighborhood.
         9: Cubic for enlarge, area for shrink, bilinear for others
-        10: Random select from interpolation method metioned above.
+        10: Random select from interpolation method mentioned above.
         Note:
         When shrinking an image, it will generally look best with AREA-based
         interpolation, whereas, when enlarging an image, it will generally look best
@@ -154,21 +158,25 @@ def resize_short_within(src, short, max_size, interp=2):
     >>> image = mx.img.imdecode(str_image)
     >>> image
     <NDArray 2321x3482x3 @cpu(0)>
-    >>> new_image = mx.img.resize_short_within(image, size=600, max_size=1000)
+    >>> new_image = resize_short_within(image, short=800, max_size=1000)
     >>> new_image
-    <NDArray 604x1000x3 @cpu(0)>
-    >>> new_image = mx.img.resize_short_within(image, size=600, max_size=1200)
+    <NDArray 667x1000x3 @cpu(0)>
+    >>> new_image = resize_short_within(image, short=800, max_size=1200)
     >>> new_image
-    <NDArray 600x993x3 @cpu(0)>
+    <NDArray 800x1200x3 @cpu(0)>
+    >>> new_image = resize_short_within(image, short=800, max_size=1200, mult_base=32)
+    >>> new_image
+    <NDArray 800x1184x3 @cpu(0)>
     """
     from mxnet.image.image import _get_interp_method as get_interp
     h, w, _ = src.shape
     im_size_min, im_size_max = (h, w) if w > h else (w, h)
     scale = float(short) / float(im_size_min)
-    if np.round(scale * im_size_max) > max_size:
+    if np.round(scale * im_size_max / mult_base) * mult_base > max_size:
         # fit in max_size
-        scale = float(max_size) / float(im_size_max)
-    new_w, new_h = int(np.round(w * scale)), int(np.round(h * scale))
+        scale = float(np.floor(max_size / mult_base) * mult_base) / float(im_size_max)
+    new_w, new_h = (int(np.round(w * scale / mult_base) * mult_base),
+                    int(np.round(h * scale / mult_base) * mult_base))
     return imresize(src, new_w, new_h, interp=get_interp(interp, (h, w, new_h, new_w)))
 
 def random_pca_lighting(src, alphastd, eigval=None, eigvec=None):
@@ -323,7 +331,7 @@ def resize_contain(src, size, fill=0):
     h, w, c = src.shape
     ow, oh = size
     scale_h = oh / h
-    scale_w = oh / w
+    scale_w = ow / w
     scale = min(min(scale_h, scale_w), 1)
     scaled_x = int(w * scale)
     scaled_y = int(h * scale)

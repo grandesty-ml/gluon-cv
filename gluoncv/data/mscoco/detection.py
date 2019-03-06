@@ -16,12 +16,12 @@ class COCODetection(VisionDataset):
 
     Parameters
     ----------
-    root : str, default '~/mxnet/datasets/voc'
+    root : str, default '~/.mxnet/datasets/voc'
         Path to folder storing the dataset.
     splits : list of str, default ['instances_val2017']
         Json annotations name.
         Candidates can be: instances_val2017, instances_train2017.
-    transform : callable, defaut None
+    transform : callable, default None
         A function that takes data and label and transforms them. Refer to
         :doc:`./transforms` for examples.
 
@@ -33,6 +33,8 @@ class COCODetection(VisionDataset):
     skip_empty : bool, default is True
         Whether skip images with no valid object. This should be `True` in training, otherwise
         it will cause undefined behavior.
+    use_crowd : bool, default is True
+        Whether use boxes labeled as crowd instance.
 
     """
     CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
@@ -51,12 +53,13 @@ class COCODetection(VisionDataset):
 
     def __init__(self, root=os.path.join('~', '.mxnet', 'datasets', 'coco'),
                  splits=('instances_val2017',), transform=None, min_object_area=0,
-                 skip_empty=True):
+                 skip_empty=True, use_crowd=True):
         super(COCODetection, self).__init__(root)
         self._root = os.path.expanduser(root)
         self._transform = transform
         self._min_object_area = min_object_area
         self._skip_empty = skip_empty
+        self._use_crowd = use_crowd
         if isinstance(splits, mx.base.string_types):
             splits = [splits]
         self._splits = splits
@@ -78,13 +81,42 @@ class COCODetection(VisionDataset):
             raise ValueError("No coco objects found, dataset not initialized.")
         elif len(self._coco) > 1:
             raise NotImplementedError(
-                "Currently we don't support evaluating {} JSON files".format(len(self._coco)))
+                "Currently we don't support evaluating {} JSON files. \
+                Please use single JSON dataset and evaluate one by one".format(len(self._coco)))
         return self._coco[0]
 
     @property
     def classes(self):
         """Category names."""
         return type(self).CLASSES
+
+    @property
+    def annotation_dir(self):
+        """
+        The subdir for annotations. Default is 'annotations'(coco default)
+        For example, a coco format json file will be searched as
+        'root/annotation_dir/xxx.json'
+        You can override if custom dataset don't follow the same pattern
+        """
+        return 'annotations'
+
+    def _parse_image_path(self, entry):
+        """How to parse image dir and path from entry.
+
+        Parameters
+        ----------
+        entry : dict
+            COCO entry, e.g. including width, height, image path, etc..
+
+        Returns
+        -------
+        abs_path : str
+            Absolute path for corresponding image.
+
+        """
+        dirname, filename = entry['coco_url'].split('/')[-2:]
+        abs_path = os.path.join(self._root, dirname, filename)
+        return abs_path
 
     def __len__(self):
         return len(self._items)
@@ -105,7 +137,7 @@ class COCODetection(VisionDataset):
         try_import_pycocotools()
         from pycocotools.coco import COCO
         for split in self._splits:
-            anno = os.path.join(self._root, 'annotations', split) + '.json'
+            anno = os.path.join(self._root, self.annotation_dir, split) + '.json'
             _coco = COCO(anno)
             self._coco.append(_coco)
             classes = [c['name'] for c in _coco.loadCats(_coco.getCatIds())]
@@ -124,8 +156,7 @@ class COCODetection(VisionDataset):
             # iterate through the annotations
             image_ids = sorted(_coco.getImgIds())
             for entry in _coco.loadImgs(image_ids):
-                dirname, filename = entry['coco_url'].split('/')[-2:]
-                abs_path = os.path.join(self._root, dirname, filename)
+                abs_path = self._parse_image_path(entry)
                 if not os.path.exists(abs_path):
                     raise IOError('Image: {} not exists.'.format(abs_path))
                 label = self._check_load_bbox(_coco, entry)
@@ -137,7 +168,10 @@ class COCODetection(VisionDataset):
 
     def _check_load_bbox(self, coco, entry):
         """Check and load ground-truth labels"""
-        ann_ids = coco.getAnnIds(imgIds=entry['id'], iscrowd=None)
+        entry_id = entry['id']
+        # fix pycocotools _isArrayLike which don't work for str in python3
+        entry_id = [entry_id] if not isinstance(entry_id, (list, tuple)) else entry_id
+        ann_ids = coco.getAnnIds(imgIds=entry_id, iscrowd=None)
         objs = coco.loadAnns(ann_ids)
         # check valid bboxes
         valid_objs = []
@@ -147,6 +181,8 @@ class COCODetection(VisionDataset):
             if obj['area'] < self._min_object_area:
                 continue
             if obj.get('ignore', 0) == 1:
+                continue
+            if not self._use_crowd and obj.get('iscrowd', 0):
                 continue
             # convert from (x, y, w, h) to (xmin, ymin, xmax, ymax) and clip bound
             xmin, ymin, xmax, ymax = bbox_clip_xyxy(bbox_xywh_to_xyxy(obj['bbox']), width, height)

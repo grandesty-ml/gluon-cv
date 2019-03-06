@@ -2,7 +2,10 @@
 from __future__ import absolute_import
 
 import sys
-import io
+try:
+    from StringIO import StringIO
+except ImportError:
+    from io import StringIO
 import os
 from os import path as osp
 import warnings
@@ -79,8 +82,14 @@ class COCODetectionMetric(mx.metric.EvalMetric):
         """Use coco to get real scores. """
         if not self._current_id == len(self._img_ids):
             warnings.warn(
-                'Recorded {} out of {} validation images, incompelete results'.format(
+                'Recorded {} out of {} validation images, incomplete results'.format(
                     self._current_id, len(self._img_ids)))
+        if not self._results:
+            # in case of empty results, push a dummy result
+            self._results.append({'image_id': self._img_ids[0],
+                                  'category_id': 0,
+                                  'bbox': [0, 0, 0, 0],
+                                  'score': 0})
         import json
         try:
             with open(self._filename, 'w') as f:
@@ -110,7 +119,11 @@ class COCODetectionMetric(mx.metric.EvalMetric):
             return ind
 
         # call real update
-        coco_eval = self._update()
+        try:
+            coco_eval = self._update()
+        except IndexError:
+            # invalid model may result in empty JSON results, skip it
+            return ['mAP',], ['0.0',]
 
         IoU_lo_thresh = 0.5
         IoU_hi_thresh = 0.95
@@ -125,7 +138,7 @@ class COCODetectionMetric(mx.metric.EvalMetric):
         names.append('~~~~ Summary metrics ~~~~\n')
         # catch coco print string, don't want directly print here
         _stdout = sys.stdout
-        sys.stdout = io.StringIO()
+        sys.stdout = StringIO()
         coco_eval.summarize()
         coco_summary = sys.stdout.getvalue()
         sys.stdout = _stdout
@@ -181,8 +194,8 @@ class COCODetectionMetric(mx.metric.EvalMetric):
                 entry = self.dataset.coco.loadImgs(imgid)[0]
                 orig_height = entry['height']
                 orig_width = entry['width']
-                height_scale = orig_height / self._data_shape[0]
-                width_scale = orig_width / self._data_shape[1]
+                height_scale = float(orig_height) / self._data_shape[0]
+                width_scale = float(orig_width) / self._data_shape[1]
             else:
                 height_scale, width_scale = (1., 1.)
             # for each bbox detection in each image

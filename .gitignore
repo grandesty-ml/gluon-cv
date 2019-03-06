@@ -1,8 +1,12 @@
 # Extra
 *.params
+*.states
 *.out
 *.swp
 .DS_Store
+.vscode
+*.npy
+*.npz
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -63,7 +67,7 @@ coverage.xml
 local_settings.py
 
 # Flask stuff:
-instance/
+# instance/
 .webassets-cache
 
 # Scrapy stuff:
@@ -110,3 +114,5 @@ ENV/
 
 *.png*
 *.jpg*
+*.jpeg*
+*.json

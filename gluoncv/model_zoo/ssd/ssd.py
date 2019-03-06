@@ -2,6 +2,7 @@
 from __future__ import absolute_import
 
 import os
+import warnings
 import mxnet as mx
 from mxnet import autograd
 from mxnet.gluon import nn
@@ -11,21 +12,26 @@ from .anchor import SSDAnchorGenerator
 from ...nn.predictor import ConvPredictor
 from ...nn.coder import MultiPerClassDecoder, NormalizedBoxCenterDecoder
 from .vgg_atrous import vgg16_atrous_300, vgg16_atrous_512
-# from ...utils import set_lr_mult
 from ...data import VOCDetection
 
 __all__ = ['SSD', 'get_ssd',
            'ssd_300_vgg16_atrous_voc',
            'ssd_300_vgg16_atrous_coco',
+           'ssd_300_vgg16_atrous_custom',
            'ssd_512_vgg16_atrous_voc',
            'ssd_512_vgg16_atrous_coco',
+           'ssd_512_vgg16_atrous_custom',
            'ssd_512_resnet18_v1_voc',
+           'ssd_512_resnet18_v1_coco',
+           'ssd_512_resnet18_v1_custom',
            'ssd_512_resnet50_v1_voc',
            'ssd_512_resnet50_v1_coco',
+           'ssd_512_resnet50_v1_custom',
            'ssd_512_resnet101_v2_voc',
            'ssd_512_resnet152_v2_voc',
            'ssd_512_mobilenet1_0_voc',
-           'ssd_512_mobilenet1_0_coco',]
+           'ssd_512_mobilenet1_0_coco',
+           'ssd_512_mobilenet1_0_custom',]
 
 
 class SSD(HybridBlock):
@@ -67,12 +73,13 @@ class SSD(HybridBlock):
         Minimum channels for the transition layers.
     global_pool : bool
         Whether to attach a global average pooling layer as the last output layer.
-    pretrained : bool
-        Description of parameter `pretrained`.
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
     stds : tuple of float, default is (0.1, 0.1, 0.2, 0.2)
         Std values to be divided/multiplied to box encoded values.
     nms_thresh : float, default is 0.45.
-        Non-maximum suppression threshold. You can speficy < 0 or > 1 to disable NMS.
+        Non-maximum suppression threshold. You can specify < 0 or > 1 to disable NMS.
     nms_topk : int, default is 400
         Apply NMS to top k detection results, use -1 to disable so that every Detection
          result is used in NMS.
@@ -87,14 +94,25 @@ class SSD(HybridBlock):
         to export to symbol so we can run it in c++, scalar, etc.
     ctx : mx.Context
         Network context.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+        This will only apply to base networks that has `norm_layer` specified, will ignore if the
+        base network (e.g. VGG) don't accept this argument.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     """
     def __init__(self, network, base_size, features, num_filters, sizes, ratios,
                  steps, classes, use_1x1_transition=True, use_bn=True,
                  reduce_ratio=1.0, min_depth=128, global_pool=False, pretrained=False,
                  stds=(0.1, 0.1, 0.2, 0.2), nms_thresh=0.45, nms_topk=400, post_nms=100,
-                 anchor_alloc_size=128, ctx=mx.cpu(), **kwargs):
+                 anchor_alloc_size=128, ctx=mx.cpu(),
+                 norm_layer=nn.BatchNorm, norm_kwargs=None, **kwargs):
         super(SSD, self).__init__(**kwargs)
+        if norm_kwargs is None:
+            norm_kwargs = {}
         if network is None:
             num_layers = len(ratios)
         else:
@@ -110,7 +128,6 @@ class SSD(HybridBlock):
         assert num_layers > 0, "SSD require at least one layer, suggest multiple."
         self._num_layers = num_layers
         self.classes = classes
-        self.num_classes = len(classes) + 1
         self.nms_thresh = nms_thresh
         self.nms_topk = nms_topk
         self.post_nms = post_nms
@@ -118,13 +135,25 @@ class SSD(HybridBlock):
         with self.name_scope():
             if network is None:
                 # use fine-grained manually designed block as features
-                self.features = features(pretrained=pretrained, ctx=ctx)
+                try:
+                    self.features = features(pretrained=pretrained, ctx=ctx,
+                                             norm_layer=norm_layer, norm_kwargs=norm_kwargs)
+                except TypeError:
+                    self.features = features(pretrained=pretrained, ctx=ctx)
             else:
-                self.features = FeatureExpander(
-                    network=network, outputs=features, num_filters=num_filters,
-                    use_1x1_transition=use_1x1_transition,
-                    use_bn=use_bn, reduce_ratio=reduce_ratio, min_depth=min_depth,
-                    global_pool=global_pool, pretrained=pretrained, ctx=ctx)
+                try:
+                    self.features = FeatureExpander(
+                        network=network, outputs=features, num_filters=num_filters,
+                        use_1x1_transition=use_1x1_transition,
+                        use_bn=use_bn, reduce_ratio=reduce_ratio, min_depth=min_depth,
+                        global_pool=global_pool, pretrained=pretrained, ctx=ctx,
+                        norm_layer=norm_layer, norm_kwargs=norm_kwargs)
+                except TypeError:
+                    self.features = FeatureExpander(
+                        network=network, outputs=features, num_filters=num_filters,
+                        use_1x1_transition=use_1x1_transition,
+                        use_bn=use_bn, reduce_ratio=reduce_ratio, min_depth=min_depth,
+                        global_pool=global_pool, pretrained=pretrained, ctx=ctx)
             self.class_predictors = nn.HybridSequential()
             self.box_predictors = nn.HybridSequential()
             self.anchor_generators = nn.HybridSequential()
@@ -135,10 +164,22 @@ class SSD(HybridBlock):
                 self.anchor_generators.add(anchor_generator)
                 asz = max(asz // 2, 16)  # pre-compute larger than 16x16 anchor map
                 num_anchors = anchor_generator.num_depth
-                self.class_predictors.add(ConvPredictor(num_anchors * self.num_classes))
+                self.class_predictors.add(ConvPredictor(num_anchors * (len(self.classes) + 1)))
                 self.box_predictors.add(ConvPredictor(num_anchors * 4))
             self.bbox_decoder = NormalizedBoxCenterDecoder(stds)
-            self.cls_decoder = MultiPerClassDecoder(self.num_classes, thresh=0.01)
+            self.cls_decoder = MultiPerClassDecoder(len(self.classes) + 1, thresh=0.01)
+
+    @property
+    def num_classes(self):
+        """Return number of foreground classes.
+
+        Returns
+        -------
+        int
+            Number of foreground classes
+
+        """
+        return len(self.classes)
 
     def set_nms(self, nms_thresh=0.45, nms_topk=400, post_nms=100):
         """Set non-maximum suppression parameters.
@@ -146,7 +187,7 @@ class SSD(HybridBlock):
         Parameters
         ----------
         nms_thresh : float, default is 0.45.
-            Non-maximum suppression threshold. You can speficy < 0 or > 1 to disable NMS.
+            Non-maximum suppression threshold. You can specify < 0 or > 1 to disable NMS.
         nms_topk : int, default is 400
             Apply NMS to top k detection results, use -1 to disable so that every Detection
              result is used in NMS.
@@ -175,7 +216,7 @@ class SSD(HybridBlock):
                      for feat, bp in zip(features, self.box_predictors)]
         anchors = [F.reshape(ag(feat), shape=(1, -1))
                    for feat, ag in zip(features, self.anchor_generators)]
-        cls_preds = F.concat(*cls_preds, dim=1).reshape((0, -1, self.num_classes))
+        cls_preds = F.concat(*cls_preds, dim=1).reshape((0, -1, self.num_classes + 1))
         box_preds = F.concat(*box_preds, dim=1).reshape((0, -1, 4))
         anchors = F.concat(*anchors, dim=1).reshape((1, -1, 4))
         if autograd.is_training():
@@ -183,7 +224,7 @@ class SSD(HybridBlock):
         bboxes = self.bbox_decoder(box_preds, anchors)
         cls_ids, scores = self.cls_decoder(F.softmax(cls_preds, axis=-1))
         results = []
-        for i in range(self.num_classes - 1):
+        for i in range(self.num_classes):
             cls_id = cls_ids.slice_axis(axis=-1, begin=i, end=i+1)
             score = scores.slice_axis(axis=-1, begin=i, end=i+1)
             # per class results
@@ -192,7 +233,7 @@ class SSD(HybridBlock):
         result = F.concat(*results, dim=1)
         if self.nms_thresh > 0 and self.nms_thresh < 1:
             result = F.contrib.box_nms(
-                result, overlap_thresh=self.nms_thresh, topk=self.nms_topk,
+                result, overlap_thresh=self.nms_thresh, topk=self.nms_topk, valid_thresh=0.01,
                 id_index=0, score_index=1, coord_start=2, force_suppress=False)
             if self.post_nms > 0:
                 result = result.slice_axis(axis=1, begin=0, end=self.post_nms)
@@ -200,6 +241,101 @@ class SSD(HybridBlock):
         scores = F.slice_axis(result, axis=2, begin=1, end=2)
         bboxes = F.slice_axis(result, axis=2, begin=2, end=6)
         return ids, scores, bboxes
+
+    def reset_class(self, classes, reuse_weights=None):
+        """Reset class categories and class predictors.
+
+        Parameters
+        ----------
+        classes : iterable of str
+            The new categories. ['apple', 'orange'] for example.
+        reuse_weights : dict
+            A {new_integer : old_integer} or mapping dict or {new_name : old_name} mapping dict,
+            or a list of [name0, name1,...] if class names don't change.
+            This allows the new predictor to reuse the
+            previously trained weights specified.
+
+        Example
+        -------
+        >>> net = gluoncv.model_zoo.get_model('ssd_512_resnet50_v1_voc', pretrained=True)
+        >>> # use direct name to name mapping to reuse weights
+        >>> net.reset_class(classes=['person'], reuse_weights={'person':'person'})
+        >>> # or use interger mapping, person is the 14th category in VOC
+        >>> net.reset_class(classes=['person'], reuse_weights={0:14})
+        >>> # you can even mix them
+        >>> net.reset_class(classes=['person'], reuse_weights={'person':14})
+        >>> # or use a list of string if class name don't change
+        >>> net.reset_class(classes=['person'], reuse_weights=['person'])
+
+        """
+        self._clear_cached_op()
+        old_classes = self.classes
+        self.classes = classes
+        # trying to reuse weights by mapping old and new classes
+        if isinstance(reuse_weights, (dict, list)):
+            if isinstance(reuse_weights, dict):
+                # trying to replace str with indices
+                for k, v in reuse_weights.items():
+                    if isinstance(v, str):
+                        try:
+                            v = old_classes.index(v)  # raise ValueError if not found
+                        except ValueError:
+                            raise ValueError(
+                                "{} not found in old class names {}".format(v, old_classes))
+                        reuse_weights[k] = v
+                    if isinstance(k, str):
+                        try:
+                            new_idx = self.classes.index(k)  # raise ValueError if not found
+                        except ValueError:
+                            raise ValueError(
+                                "{} not found in new class names {}".format(k, self.classes))
+                        reuse_weights.pop(k)
+                        reuse_weights[new_idx] = v
+            else:
+                new_map = {}
+                for x in reuse_weights:
+                    try:
+                        new_idx = self.classes.index(x)
+                        old_idx = old_classes.index(x)
+                        new_map[new_idx] = old_idx
+                    except ValueError:
+                        warnings.warn("{} not found in old: {} or new class names: {}".format(
+                            x, old_classes, self.classes))
+                reuse_weights = new_map
+        # replace class predictors
+        with self.name_scope():
+            class_predictors = nn.HybridSequential(prefix=self.class_predictors.prefix)
+            for i, ag in zip(range(len(self.class_predictors)), self.anchor_generators):
+                # Re-use the same prefix and ctx_list as used by the current ConvPredictor
+                prefix = self.class_predictors[i].prefix
+                old_pred = self.class_predictors[i].predictor
+                ctx = list(old_pred.params.values())[0].list_ctx()
+                # to avoid deferred init, number of in_channels must be defined
+                in_channels = list(old_pred.params.values())[0].shape[1]
+                new_cp = ConvPredictor(ag.num_depth * (self.num_classes + 1),
+                                       in_channels=in_channels, prefix=prefix)
+                new_cp.collect_params().initialize(ctx=ctx)
+                if reuse_weights:
+                    assert isinstance(reuse_weights, dict)
+                    for old_params, new_params in zip(old_pred.params.values(),
+                                                      new_cp.predictor.params.values()):
+                        old_data = old_params.data()
+                        new_data = new_params.data()
+
+                        for k, v in reuse_weights.items():
+                            if k >= len(self.classes) or v >= len(old_classes):
+                                warnings.warn("reuse mapping {}/{} -> {}/{} out of range".format(
+                                    k, self.classes, v, old_classes))
+                                continue
+                            # always increment k and v (background is always the 0th)
+                            new_data[k+1::len(self.classes)+1] = old_data[v+1::len(old_classes)+1]
+                        # reuse background weights as well
+                        new_data[0::len(self.classes)+1] = old_data[0::len(old_classes)+1]
+                        # set data to new conv layers
+                        new_params.set_data(new_data)
+                class_predictors.add(new_cp)
+            self.class_predictors = class_predictors
+            self.cls_decoder = MultiPerClassDecoder(len(self.classes) + 1, thresh=0.01)
 
 def get_ssd(name, base_size, features, filters, sizes, ratios, steps, classes,
             dataset, pretrained=False, pretrained_base=True, ctx=mx.cpu(),
@@ -216,7 +352,7 @@ def get_ssd(name, base_size, features, filters, sizes, ratios, steps, classes,
     features : iterable of str or `HybridBlock`
         List of network internal output names, in order to specify which layers are
         used for predicting bbox values.
-        If `name` is `None`, `features` must be a `HybridBlock` which generate mutliple
+        If `name` is `None`, `features` must be a `HybridBlock` which generate multiple
         outputs for prediction.
     filters : iterable of float or None
         List of convolution layer channels which is going to be appended to the base
@@ -236,16 +372,23 @@ def get_ssd(name, base_size, features, filters, sizes, ratios, steps, classes,
         Names of categories.
     dataset : str
         Name of dataset. This is used to identify model name because models trained on
-        differnet datasets are going to be very different.
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+        different datasets are going to be very different.
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized. Note that
-        if pretrained is `Ture`, this has no effect.
+        if pretrained is `True`, this has no effect.
     ctx : mxnet.Context
         Context such as mx.cpu(), mx.gpu(0).
     root : str
         Model weights storing path.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -259,8 +402,7 @@ def get_ssd(name, base_size, features, filters, sizes, ratios, steps, classes,
     if pretrained:
         from ..model_store import get_model_file
         full_name = '_'.join(('ssd', str(base_size), name, dataset))
-        net.load_params(get_model_file(full_name, root=root), ctx=ctx)
-    # set_lr_mult(net, ".*_bias", 2.0)
+        net.load_parameters(get_model_file(full_name, tag=pretrained, root=root), ctx=ctx)
     return net
 
 def ssd_300_vgg16_atrous_voc(pretrained=False, pretrained_base=True, **kwargs):
@@ -268,9 +410,10 @@ def ssd_300_vgg16_atrous_voc(pretrained=False, pretrained_base=True, **kwargs):
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
 
     Returns
@@ -292,9 +435,10 @@ def ssd_300_vgg16_atrous_coco(pretrained=False, pretrained_base=True, **kwargs):
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
 
     Returns
@@ -312,14 +456,57 @@ def ssd_300_vgg16_atrous_coco(pretrained=False, pretrained_base=True, **kwargs):
                   pretrained_base=pretrained_base, **kwargs)
     return net
 
+def ssd_300_vgg16_atrous_custom(classes, pretrained_base=True, pretrained=False,
+                                transfer=None, **kwargs):
+    """SSD architecture with VGG16 atrous 300x300 base network for COCO.
+
+    Parameters
+    ----------
+    classes : iterable of str
+        Names of custom foreground classes. `len(classes)` is the number of foreground classes.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    transfer : str or None
+        If not `None`, will try to reuse pre-trained weights from SSD networks trained on other
+        datasets.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+
+    Example
+    -------
+    >>> net = ssd_300_vgg16_atrous_custom(classes=['a', 'b', 'c'], pretrained_base=True)
+    >>> net = ssd_300_vgg16_atrous_custom(classes=['foo', 'bar'], transfer='coco')
+
+    """
+    if pretrained:
+        warnings.warn("Custom models don't provide `pretrained` weights, ignored.")
+    if transfer is None:
+        kwargs['pretrained'] = False
+        net = get_ssd('vgg16_atrous', 300, features=vgg16_atrous_300, filters=None,
+                      sizes=[21, 45, 99, 153, 207, 261, 315],
+                      ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                      steps=[8, 16, 32, 64, 100, 300],
+                      classes=classes, dataset='',
+                      pretrained_base=pretrained_base, **kwargs)
+    else:
+        from ...model_zoo import get_model
+        net = get_model('ssd_300_vgg16_atrous_' + str(transfer), pretrained=True, **kwargs)
+        reuse_classes = [x for x in classes if x in net.classes]
+        net.reset_class(classes, reuse_weights=reuse_classes)
+    return net
+
 def ssd_512_vgg16_atrous_voc(pretrained=False, pretrained_base=True, **kwargs):
     """SSD architecture with VGG16 atrous 512x512 base network.
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
 
     Returns
@@ -336,15 +523,89 @@ def ssd_512_vgg16_atrous_voc(pretrained=False, pretrained_base=True, **kwargs):
                   pretrained_base=pretrained_base, **kwargs)
     return net
 
+def ssd_512_vgg16_atrous_coco(pretrained=False, pretrained_base=True, **kwargs):
+    """SSD architecture with VGG16 atrous layers for COCO.
+
+    Parameters
+    ----------
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+    """
+    from ...data import COCODetection
+    classes = COCODetection.CLASSES
+    return get_ssd('vgg16_atrous', 512, features=vgg16_atrous_512, filters=None,
+                   sizes=[51.2, 76.8, 153.6, 230.4, 307.2, 384.0, 460.8, 537.6],
+                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 4 + [[1, 2, 0.5]] * 2,
+                   steps=[8, 16, 32, 64, 128, 256, 512],
+                   classes=classes, dataset='coco', pretrained=pretrained,
+                   pretrained_base=pretrained_base, **kwargs)
+
+def ssd_512_vgg16_atrous_custom(classes, pretrained_base=True, pretrained=False,
+                                transfer=None, **kwargs):
+    """SSD architecture with VGG16 atrous 300x300 base network for COCO.
+
+    Parameters
+    ----------
+    classes : iterable of str
+        Names of custom foreground classes. `len(classes)` is the number of foreground classes.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    transfer : str or None
+        If not `None`, will try to reuse pre-trained weights from SSD networks trained on other
+        datasets.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+
+    Example
+    -------
+    >>> net = ssd_512_vgg16_atrous_custom(classes=['a', 'b', 'c'], pretrained_base=True)
+    >>> net = ssd_512_vgg16_atrous_custom(classes=['foo', 'bar'], transfer='coco')
+
+    """
+    if pretrained:
+        warnings.warn("Custom models don't provide `pretrained` weights, ignored.")
+    if transfer is None:
+        kwargs['pretrained'] = False
+        net = get_ssd('vgg16_atrous', 512, features=vgg16_atrous_512, filters=None,
+                      sizes=[51.2, 76.8, 153.6, 230.4, 307.2, 384.0, 460.8, 537.6],
+                      ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 4 + [[1, 2, 0.5]] * 2,
+                      steps=[8, 16, 32, 64, 128, 256, 512],
+                      classes=classes, dataset='',
+                      pretrained_base=pretrained_base, **kwargs)
+    else:
+        from ...model_zoo import get_model
+        net = get_model('ssd_512_vgg16_atrous_' + str(transfer), pretrained=True, **kwargs)
+        reuse_classes = [x for x in classes if x in net.classes]
+        net.reset_class(classes, reuse_weights=reuse_classes)
+    return net
+
 def ssd_512_resnet18_v1_voc(pretrained=False, pretrained_base=True, **kwargs):
     """SSD architecture with ResNet v1 18 layers.
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -357,19 +618,109 @@ def ssd_512_resnet18_v1_voc(pretrained=False, pretrained_base=True, **kwargs):
                    filters=[512, 512, 256, 256],
                    sizes=[51.2, 102.4, 189.4, 276.4, 363.52, 450.6, 492],
                    ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
-                   steps=[8, 16, 32, 64, 128, 256, 512],
+                   steps=[16, 32, 64, 128, 256, 512],
                    classes=classes, dataset='voc', pretrained=pretrained,
                    pretrained_base=pretrained_base, **kwargs)
+
+def ssd_512_resnet18_v1_coco(pretrained=False, pretrained_base=True, **kwargs):
+    """SSD architecture with ResNet v1 18 layers.
+
+    Parameters
+    ----------
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+    """
+    from ...data import COCODetection
+    classes = COCODetection.CLASSES
+    return get_ssd('resnet18_v1', 512,
+                   features=['stage3_activation1', 'stage4_activation1'],
+                   filters=[512, 512, 256, 256],
+                   sizes=[51.2, 102.4, 189.4, 276.4, 363.52, 450.6, 492],
+                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                   steps=[16, 32, 64, 128, 256, 512],
+                   classes=classes, dataset='coco', pretrained=pretrained,
+                   pretrained_base=pretrained_base, **kwargs)
+
+def ssd_512_resnet18_v1_custom(classes, pretrained_base=True, pretrained=False,
+                               transfer=None, **kwargs):
+    """SSD architecture with ResNet18 v1 512 base network for COCO.
+
+    Parameters
+    ----------
+    classes : iterable of str
+        Names of custom foreground classes. `len(classes)` is the number of foreground classes.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    transfer : str or None
+        If not `None`, will try to reuse pre-trained weights from SSD networks trained on other
+        datasets.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+
+    Example
+    -------
+    >>> net = ssd_512_resnet18_v1_custom(classes=['a', 'b', 'c'], pretrained_base=True)
+    >>> net = ssd_512_resnet18_v1_custom(classes=['foo', 'bar'], transfer='voc')
+
+    """
+    if pretrained:
+        warnings.warn("Custom models don't provide `pretrained` weights, ignored.")
+    if transfer is None:
+        kwargs['pretrained'] = False
+        net = get_ssd('resnet18_v1', 512,
+                      features=['stage3_activation1', 'stage4_activation1'],
+                      filters=[512, 512, 256, 256],
+                      sizes=[51.2, 102.4, 189.4, 276.4, 363.52, 450.6, 492],
+                      ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                      steps=[16, 32, 64, 128, 256, 512],
+                      classes=classes, dataset='',
+                      pretrained_base=pretrained_base, **kwargs)
+    else:
+        from ...model_zoo import get_model
+        net = get_model('ssd_512_resnet18_v1_' + str(transfer), pretrained=True, **kwargs)
+        reuse_classes = [x for x in classes if x in net.classes]
+        net.reset_class(classes, reuse_weights=reuse_classes)
+    return net
 
 def ssd_512_resnet50_v1_voc(pretrained=False, pretrained_base=True, **kwargs):
     """SSD architecture with ResNet v1 50 layers.
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -386,15 +737,105 @@ def ssd_512_resnet50_v1_voc(pretrained=False, pretrained_base=True, **kwargs):
                    classes=classes, dataset='voc', pretrained=pretrained,
                    pretrained_base=pretrained_base, **kwargs)
 
+def ssd_512_resnet50_v1_coco(pretrained=False, pretrained_base=True, **kwargs):
+    """SSD architecture with ResNet v1 50 layers for COCO.
+
+    Parameters
+    ----------
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+    """
+    from ...data import COCODetection
+    classes = COCODetection.CLASSES
+    return get_ssd('resnet50_v1', 512,
+                   features=['stage3_activation5', 'stage4_activation2'],
+                   filters=[512, 512, 256, 256],
+                   sizes=[51.2, 133.12, 215.04, 296.96, 378.88, 460.8, 542.72],
+                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                   steps=[16, 32, 64, 128, 256, 512],
+                   classes=classes, dataset='coco', pretrained=pretrained,
+                   pretrained_base=pretrained_base, **kwargs)
+
+def ssd_512_resnet50_v1_custom(classes, pretrained_base=True, pretrained=False,
+                               transfer=None, **kwargs):
+    """SSD architecture with ResNet50 v1 512 base network for custom dataset.
+
+    Parameters
+    ----------
+    classes : iterable of str
+        Names of custom foreground classes. `len(classes)` is the number of foreground classes.
+    pretrained_base : bool or str, optional, default is True
+        Load pretrained base network, the extra layers are randomized.
+    transfer : str or None
+        If not `None`, will try to reuse pre-trained weights from SSD networks trained on other
+        datasets.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+
+    Returns
+    -------
+    HybridBlock
+        A SSD detection network.
+
+    Example
+    -------
+    >>> net = ssd_512_resnet50_v1_custom(classes=['a', 'b', 'c'], pretrained_base=True)
+    >>> net = ssd_512_resnet50_v1_custom(classes=['foo', 'bar'], transfer='voc')
+
+    """
+    if pretrained:
+        warnings.warn("Custom models don't provide `pretrained` weights, ignored.")
+    if transfer is None:
+        kwargs['pretrained'] = False
+        net = get_ssd('resnet50_v1', 512,
+                      features=['stage3_activation5', 'stage4_activation2'],
+                      filters=[512, 512, 256, 256],
+                      sizes=[51.2, 133.12, 215.04, 296.96, 378.88, 460.8, 542.72],
+                      ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                      steps=[16, 32, 64, 128, 256, 512],
+                      classes=classes, dataset='',
+                      pretrained_base=pretrained_base, **kwargs)
+    else:
+        from ...model_zoo import get_model
+        net = get_model('ssd_512_resnet50_v1_' + str(transfer), pretrained=True, **kwargs)
+        reuse_classes = [x for x in classes if x in net.classes]
+        net.reset_class(classes, reuse_weights=reuse_classes)
+    return net
+
 def ssd_512_resnet101_v2_voc(pretrained=False, pretrained_base=True, **kwargs):
     """SSD architecture with ResNet v2 101 layers.
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -416,10 +857,17 @@ def ssd_512_resnet152_v2_voc(pretrained=False, pretrained_base=True, **kwargs):
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -441,10 +889,17 @@ def ssd_512_mobilenet1_0_voc(pretrained=False, pretrained_base=True, **kwargs):
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -466,10 +921,17 @@ def ssd_512_mobilenet1_0_coco(pretrained=False, pretrained_base=True, **kwargs):
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    pretrained : bool or str
+        Boolean value controls whether to load the default pretrained weights for model.
+        String value represents the hashtag for a certain version of pretrained weights.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
@@ -487,53 +949,52 @@ def ssd_512_mobilenet1_0_coco(pretrained=False, pretrained_base=True, **kwargs):
                    classes=classes, dataset='coco', pretrained=pretrained,
                    pretrained_base=pretrained_base, **kwargs)
 
-def ssd_512_vgg16_atrous_coco(pretrained=False, pretrained_base=True, **kwargs):
-    """SSD architecture with VGG16 atrous layers for COCO.
+def ssd_512_mobilenet1_0_custom(classes, pretrained_base=True, pretrained=False,
+                                transfer=None, **kwargs):
+    """SSD architecture with mobilenet1.0 512 base network for custom dataset.
 
     Parameters
     ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
+    classes : iterable of str
+        Names of custom foreground classes. `len(classes)` is the number of foreground classes.
+    pretrained_base : bool or str, optional, default is True
         Load pretrained base network, the extra layers are randomized.
+    transfer : str or None
+        If not `None`, will try to reuse pre-trained weights from SSD networks trained on other
+        datasets.
+    norm_layer : object
+        Normalization layer used (default: :class:`mxnet.gluon.nn.BatchNorm`)
+        Can be :class:`mxnet.gluon.nn.BatchNorm` or :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
+    norm_kwargs : dict
+        Additional `norm_layer` arguments, for example `num_devices=4`
+        for :class:`mxnet.gluon.contrib.nn.SyncBatchNorm`.
 
     Returns
     -------
     HybridBlock
         A SSD detection network.
-    """
-    from ...data import COCODetection
-    classes = COCODetection.CLASSES
-    return get_ssd('vgg16_atrous', 512, features=vgg16_atrous_512, filters=None,
-                   sizes=[51.2, 76.8, 153.6, 230.4, 307.2, 384.0, 460.8, 537.6],
-                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 4 + [[1, 2, 0.5]] * 2,
-                   steps=[8, 16, 32, 64, 128, 256, 512],
-                   classes=classes, dataset='coco', pretrained=pretrained,
-                   pretrained_base=pretrained_base, **kwargs)
 
-
-def ssd_512_resnet50_v1_coco(pretrained=False, pretrained_base=True, **kwargs):
-    """SSD architecture with ResNet v1 50 layers for COCO.
-
-    Parameters
-    ----------
-    pretrained : bool, optional, default is False
-        Load pretrained weights.
-    pretrained_base : bool, optional, default is True
-        Load pretrained base network, the extra layers are randomized.
-
-    Returns
+    Example
     -------
-    HybridBlock
-        A SSD detection network.
+    >>> net = ssd_512_mobilenet1_0_custom(classes=['a', 'b', 'c'], pretrained_base=True)
+    >>> net = ssd_512_mobilenet1_0_custom(classes=['foo', 'bar'], transfer='voc')
+
     """
-    from ...data import COCODetection
-    classes = COCODetection.CLASSES
-    return get_ssd('resnet50_v1', 512,
-                   features=['stage3_activation5', 'stage4_activation2'],
-                   filters=[512, 512, 256, 256],
-                   sizes=[51.2, 133.12, 215.04, 296.96, 378.88, 460.8, 542.72],
-                   ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
-                   steps=[16, 32, 64, 128, 256, 512],
-                   classes=classes, dataset='coco', pretrained=pretrained,
-                   pretrained_base=pretrained_base, **kwargs)
+    if pretrained:
+        warnings.warn("Custom models don't provide `pretrained` weights, ignored.")
+    if transfer is None:
+        kwargs['pretrained'] = False
+        net = get_ssd('mobilenet1.0', 512,
+                      features=['relu22_fwd', 'relu26_fwd'],
+                      filters=[512, 512, 256, 256],
+                      sizes=[51.2, 102.4, 189.4, 276.4, 363.52, 450.6, 492],
+                      ratios=[[1, 2, 0.5]] + [[1, 2, 0.5, 3, 1.0/3]] * 3 + [[1, 2, 0.5]] * 2,
+                      steps=[16, 32, 64, 128, 256, 512],
+                      classes=classes, dataset='',
+                      pretrained_base=pretrained_base, **kwargs)
+    else:
+        from ...model_zoo import get_model
+        net = get_model('ssd_512_mobilenet1.0_' + str(transfer), pretrained=True, **kwargs)
+        reuse_classes = [x for x in classes if x in net.classes]
+        net.reset_class(classes, reuse_weights=reuse_classes)
+    return net

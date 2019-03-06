@@ -21,6 +21,10 @@ Visualization
 
     plot_bbox
 
+    expand_mask
+
+    plot_mask
+
 Miscellaneous
 -------------
 
@@ -33,7 +37,7 @@ Miscellaneous
 
     makedirs
 
-    random.random
+    random.seed
 
 Training Helpers
 ----------------
